@@ -1,7 +1,7 @@
 import json
 import os
 import threading
-import ctypes
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -39,9 +39,12 @@ config = load_config()
 # State
 # ---------------------------------------------------------------------------
 
-buffer = []
 state = {"recording": False}
 tray_icon = None
+
+# Invisible marker — Unicode Private Use Area character, never appears in
+# normal text, supported by every modern editor.
+MARKER = "\uE000"
 
 # ---------------------------------------------------------------------------
 # Icon helpers
@@ -70,75 +73,61 @@ def update_icon(mode):
 
 
 # ---------------------------------------------------------------------------
-# Keyboard capture
+# Capture logic
 # ---------------------------------------------------------------------------
-
-SHIFT_MAP = {
-    "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
-    "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
-    "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|",
-    ";": ":", "'": '"', ",": "<", ".": ">", "/": "?", "`": "~",
-}
-
-
-def caps_lock_on():
-    return bool(ctypes.WinDLL("User32.dll").GetKeyState(0x14) & 1)
-
-
-def resolve_char(event):
-    """Return the printable character for this keypress, or None."""
-    name = event.name
-    if not name or len(name) != 1:
-        return None
-    shift = keyboard.is_pressed("shift")
-    caps = caps_lock_on()
-    if name in SHIFT_MAP:
-        return SHIFT_MAP[name] if shift else name
-    if name.isalpha():
-        upper = shift ^ caps  # XOR: caps inverts, shift toggles again
-        return name.upper() if upper else name
-    return name
-
 
 def toggle_capture():
     if not state["recording"]:
-        buffer.clear()
+        # F9 #1 — plant invisible start marker at the current cursor position
         state["recording"] = True
         update_icon("recording")
+        keyboard.write(MARKER)
+
     else:
-        text = "".join(buffer)
+        # F9 #2 — plant end marker, grab whole doc, extract between markers,
+        #          then undo both marker insertions so the doc is untouched.
         state["recording"] = False
         update_icon("idle")
-        if text:
-            pyperclip.copy(text)
+
+        keyboard.write(MARKER)          # end marker
+        time.sleep(0.08)
+        keyboard.send("ctrl+a")         # select all text in the editor
+        time.sleep(0.08)
+        keyboard.send("ctrl+c")         # copy it
+        time.sleep(0.15)                # give clipboard time to update
+
+        full = pyperclip.paste()
+        parts = full.split(MARKER)
+
+        if len(parts) >= 3:
+            # Normal case: before | captured | after
+            extracted = parts[1]
+        elif len(parts) == 2:
+            # Marker was at the very end of the document
+            extracted = parts[1]
+        else:
+            extracted = ""
+
+        # Undo the two marker insertions — document returns to its original state
+        keyboard.send("ctrl+z")
+        time.sleep(0.05)
+        keyboard.send("ctrl+z")
+        time.sleep(0.05)
+
+        if extracted:
+            pyperclip.copy(extracted)
             if config["notify"] and tray_icon is not None:
-                tray_icon.notify(f"Copied {len(text)} character{'s' if len(text) != 1 else ''}", "TextCopy")
+                tray_icon.notify(
+                    f"Copied {len(extracted)} character{'s' if len(extracted) != 1 else ''}",
+                    "TextCopy",
+                )
 
 
 def on_key_event(event):
     if event.event_type != keyboard.KEY_DOWN:
         return
-
     if event.name == config["hotkey"]:
         toggle_capture()
-        return
-
-    if not state["recording"]:
-        return
-
-    if event.name == "backspace":
-        if buffer:
-            buffer.pop()
-    elif event.name == "enter":
-        buffer.append("\n")
-    elif event.name == "tab":
-        buffer.append("\t")
-    elif event.name == "space":
-        buffer.append(" ")
-    else:
-        ch = resolve_char(event)
-        if ch:
-            buffer.append(ch)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +160,6 @@ def open_settings():
         config["hotkey"] = hotkey_var.get().lower()
         config["notify"] = notify_var.get()
         save_config(config)
-        # Re-register the hook so the new hotkey takes effect immediately
         keyboard.unhook_all()
         keyboard.hook(on_key_event)
         update_icon("idle")
