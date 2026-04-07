@@ -1,0 +1,12 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Config (personal settings, created at runtime)
+config.json
