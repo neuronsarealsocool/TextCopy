@@ -40,6 +40,7 @@ config = load_config()
 # ---------------------------------------------------------------------------
 
 state = {"recording": False}
+_capture_lock = threading.Lock()
 tray_icon = None
 
 # Invisible marker — Unicode Private Use Area character, never appears in
@@ -77,57 +78,64 @@ def update_icon(mode):
 # ---------------------------------------------------------------------------
 
 def toggle_capture():
-    if not state["recording"]:
-        # F9 #1 — plant invisible start marker at the current cursor position
-        state["recording"] = True
-        update_icon("recording")
-        keyboard.write(MARKER)
+    # Non-blocking lock — silently drops rapid double-presses
+    if not _capture_lock.acquire(blocking=False):
+        return
+    try:
+        if not state["recording"]:
+            # F9 #1 — plant invisible start marker at the current cursor position
+            state["recording"] = True
+            update_icon("recording")
+            keyboard.write(MARKER)
 
-    else:
-        # F9 #2 — plant end marker, grab whole doc, extract between markers,
-        #          then undo both marker insertions so the doc is untouched.
-        state["recording"] = False
-        update_icon("idle")
-
-        keyboard.write(MARKER)          # end marker
-        time.sleep(0.08)
-        keyboard.send("ctrl+a")         # select all text in the editor
-        time.sleep(0.08)
-        keyboard.send("ctrl+c")         # copy it
-        time.sleep(0.15)                # give clipboard time to update
-
-        full = pyperclip.paste()
-        parts = full.split(MARKER)
-
-        if len(parts) >= 3:
-            # Normal case: before | captured | after
-            extracted = parts[1]
-        elif len(parts) == 2:
-            # Marker was at the very end of the document
-            extracted = parts[1]
         else:
-            extracted = ""
+            # F9 #2 — plant end marker, grab whole doc, extract between markers,
+            #          then undo both marker insertions so the doc is untouched.
+            state["recording"] = False
+            update_icon("idle")
 
-        # Undo the two marker insertions — document returns to its original state
-        keyboard.send("ctrl+z")
-        time.sleep(0.05)
-        keyboard.send("ctrl+z")
-        time.sleep(0.05)
+            keyboard.write(MARKER)          # end marker
+            time.sleep(0.08)
+            keyboard.send("ctrl+a")         # select all text in the editor
+            time.sleep(0.08)
+            keyboard.send("ctrl+c")         # copy it
+            time.sleep(0.15)                # give clipboard time to update
 
-        if extracted:
-            pyperclip.copy(extracted)
-            if config["notify"] and tray_icon is not None:
-                tray_icon.notify(
-                    f"Copied {len(extracted)} character{'s' if len(extracted) != 1 else ''}",
-                    "TextCopy",
-                )
+            full = pyperclip.paste()
+            parts = full.split(MARKER)
+
+            # Always extract from the LAST pair of markers.
+            # Markers may accumulate across captures if Ctrl+Z undo doesn't
+            # clean up perfectly (undo granularity varies by editor), but
+            # parts[-2] is always the text from the most recent F9 session.
+            extracted = parts[-2] if len(parts) >= 3 else ""
+
+            # Best-effort cleanup — undo the two markers we just inserted.
+            keyboard.send("ctrl+z")
+            time.sleep(0.05)
+            keyboard.send("ctrl+z")
+            time.sleep(0.05)
+
+            if extracted:
+                pyperclip.copy(extracted)
+                if config["notify"] and tray_icon is not None:
+                    tray_icon.notify(
+                        f"Copied {len(extracted)} character{'s' if len(extracted) != 1 else ''}",
+                        "TextCopy",
+                    )
+    finally:
+        _capture_lock.release()
 
 
 def on_key_event(event):
     if event.event_type != keyboard.KEY_DOWN:
         return
     if event.name == config["hotkey"]:
-        toggle_capture()
+        # Spawn a daemon thread so the hook callback returns instantly.
+        # Calling toggle_capture() directly would block the hook thread with
+        # keyboard.send / time.sleep calls, causing captures to fail after
+        # the first one.
+        threading.Thread(target=toggle_capture, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
